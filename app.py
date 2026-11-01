@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Web app + Telegram bot bridge in ONE service (Railway).
-Webhook on /telegram
-Login via bot messages: /login → phone → code → (2fa) → TG_SESSION
+AI Chat + Telegram account bridge — better web UI, login from site.
 """
 
-import os, uuid, asyncio, requests, base64 as b64
+import os, uuid, asyncio, requests, traceback
 from flask import Flask, request, jsonify, render_template_string, session
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ai-bridge-secret")
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
@@ -20,17 +17,24 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 SESSION_STR = os.environ.get("TG_SESSION", "").strip()
 PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or os.environ.get("PUBLIC_URL", "")
 
-SESSIONS = {}       # web chat sessions
-HISTORY = {}        # telegram chat history
-LOGIN = {}          # bot login state
-user_client = None
+WEB_SESSIONS = {}
+TG_HISTORY = {}
+LOGIN_STATE = {}  # sid -> telethon state
 _loop = None
 
-# ---------- AI ----------
+def get_loop():
+    global _loop
+    if _loop is None:
+        _loop = asyncio.new_event_loop()
+    return _loop
+
+def run_async(coro):
+    return get_loop().run_until_complete(coro)
+
 def ask_ai(question, history):
     key = GROQ_KEY or OPENROUTER_KEY
     if not key:
-        return "GROQ_API_KEY ناقص"
+        return "أضف GROQ_API_KEY في Railway Variables"
     if GROQ_KEY:
         base, model = "https://api.groq.com/openai/v1", "openai/gpt-oss-20b"
         headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
@@ -40,206 +44,225 @@ def ask_ai(question, history):
             "Authorization": f"Bearer {OPENROUTER_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/csjdvdhdh/ai-chat-mobile",
-            "X-Title": "AI Bridge",
+            "X-Title": "AI Chat",
         }
-    msgs = [{"role": "system", "content": "Assistant. Same language as user. Concise. Code in ``` fences."}]
-    msgs += history[-10:] + [{"role": "user", "content": question}]
-    payload = {"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1200}
+    msgs = [{"role": "system", "content": "Helpful assistant. Same language as user. Concise. Code in ``` fences."}]
+    msgs += history[-12:] + [{"role": "user", "content": question}]
+    payload = {"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1500}
     try:
         r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200 and GROQ_KEY:
             payload["model"] = "qwen/qwen3.8-27b"
             r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            return f"AI {r.status_code}: {r.text[:100]}"
+            return f"خطأ {r.status_code}: {r.text[:150]}"
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return str(e)
+        return f"خطأ: {e}"
 
-# ---------- Telegram Bot API helpers ----------
 def tg(method, **params):
     if not BOT_TOKEN:
         return {}
     return requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params, timeout=30).json()
 
 def tsend(chat_id, text):
-    if len(text) > 4000:
-        text = text[:4000] + "\n..."
-    tg("sendMessage", chat_id=chat_id, text=text)
+    tg("sendMessage", chat_id=chat_id, text=(text or "")[:4000])
 
-# ---------- Telethon login (lazy import) ----------
-async def _telethon_send_code(phone):
+# ---- Telethon helpers ----
+async def tg_send_code(phone):
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-    result = await client.send_code_request(phone)
-    return client, result.phone_code_hash
+    res = await client.send_code_request(phone)
+    return client, res.phone_code_hash
 
-async def _telethon_sign_in(client, phone, code, phone_code_hash, password=None):
+async def tg_sign_in(client, phone, code, pch, password=None):
     from telethon.errors import SessionPasswordNeededError
     try:
-        if password:
+        if password is not None:
             await client.sign_in(password=password)
         else:
-            await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            await client.sign_in(phone, code, phone_code_hash=pch)
         return client.session.save(), None
     except SessionPasswordNeededError:
         return None, "2fa"
     except Exception as e:
         return None, str(e)
 
-def run_async(coro):
-    global _loop
-    if _loop is None:
-        _loop = asyncio.new_event_loop()
-    return _loop.run_until_complete(coro)
-
-# ---------- Bot message handler ----------
-def handle_bot(msg):
-    chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
-
-    if text.startswith("/start") or text.startswith("/help"):
-        tsend(chat_id,
-              "جسر حسابك ↔ الذكاء\n\n"
-              "/login — ربط حسابك\n"
-              "/status — حالة الربط\n"
-              "/ai سؤالك — من البوت مباشرة\n\n"
-              "بعد الربط: من حسابك اكتب /ai في أي شات")
-        return
-
-    if text.startswith("/status"):
-        tsend(chat_id, "مرتبط ✓" if SESSION_STR or user_client else "غير مرتبط — /login")
-        return
-
-    if text.startswith("/login"):
-        LOGIN[chat_id] = {"step": "phone"}
-        tsend(chat_id, "أرسل رقمك مع رمز الدولة\nمثال: +9639xxxxxxx")
-        return
-
-    st = LOGIN.get(chat_id)
-    if st:
-        step = st.get("step")
-        if step == "phone":
-            phone = text.replace(" ", "")
-            if not phone.startswith("+"):
-                tsend(chat_id, "الرقم يبدأ بـ +")
-                return
-            if not API_ID or not API_HASH:
-                tsend(chat_id, "TG_API_ID / TG_API_HASH ناقصين في Railway")
-                return
-            try:
-                client, pch = run_async(_telethon_send_code(phone))
-                LOGIN[chat_id] = {"step": "code", "phone": phone, "pch": pch, "client": client}
-                tsend(chat_id, "تم إرسال الكود — أرسله هنا")
-            except Exception as e:
-                tsend(chat_id, f"فشل: {e}")
-            return
-
-        if step == "code":
-            client = st["client"]
-            session_str, err = run_async(_telethon_sign_in(client, st["phone"], text, st["pch"]))
-            if err == "2fa":
-                LOGIN[chat_id]["step"] = "2fa"
-                tsend(chat_id, "أرسل كلمة مرور التحقق بخطوتين")
-                return
-            if err:
-                tsend(chat_id, f"فشل: {err}")
-                return
-            LOGIN.pop(chat_id, None)
-            tsend(chat_id,
-                  "تم الربط ✓\n\n"
-                  "انسخ السطر التالي وضعه Variable في Railway اسمه TG_SESSION ثم Redeploy:\n\n"
-                  + session_str)
-            return
-
-        if step == "2fa":
-            client = st["client"]
-            session_str, err = run_async(_telethon_sign_in(client, st["phone"], None, None, password=text))
-            if err:
-                tsend(chat_id, f"فشل: {err}")
-                return
-            LOGIN.pop(chat_id, None)
-            tsend(chat_id,
-                  "تم الربط ✓\n\n"
-                  "ضع هذا في Railway Variable → TG_SESSION ثم Redeploy:\n\n"
-                  + session_str)
-            return
-
-    if text.startswith("/ai"):
-        q = text[3:].strip()
-        if not q and msg.get("reply_to_message"):
-            q = (msg["reply_to_message"].get("text") or "").strip()
-        if not q:
-            tsend(chat_id, "/ai سؤالك")
-            return
-        hist = HISTORY.setdefault(chat_id, [])
-        tsend(chat_id, "يفكر...")
-        ans = ask_ai(q, hist)
-        hist.append({"role": "user", "content": q})
-        hist.append({"role": "assistant", "content": ans})
-        if len(hist) > 20:
-            HISTORY[chat_id] = hist[-20:]
-        tsend(chat_id, ans)
-        return
-
-# ---------- Webhook ----------
-@app.route("/telegram", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json(force=True, silent=True) or {}
-    msg = data.get("message") or data.get("edited_message")
-    if msg:
-        try:
-            handle_bot(msg)
-        except Exception as e:
-            print("bot err", e)
-    return jsonify({"ok": True})
-
-@app.route("/setup_webhook")
-def setup_webhook():
-    """Call once: /setup_webhook?url=https://your-app.up.railway.app"""
-    url = request.args.get("url") or (f"https://{PUBLIC_URL}" if PUBLIC_URL else "")
-    if not url:
-        return "pass ?url=https://xxx.up.railway.app", 400
-    hook = url.rstrip("/") + "/telegram"
-    r = tg("setWebhook", url=hook)
-    return jsonify(r)
-
-# ---------- Web chat (same as before, shortened) ----------
-WEB_HTML = r"""<!DOCTYPE html>
-<html lang="ar" dir="rtl"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+# ---- Web UI ----
+PAGE = r"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#0b0b12">
 <title>AI Chat</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui;background:#0d0d14;color:#eee;height:100dvh;display:flex;flex-direction:column}
-header{background:#1a1a24;padding:12px;display:flex;justify-content:space-between;align-items:center}
-header button{background:#0d0d14;color:#eee;border:1px solid #333;border-radius:8px;padding:6px 12px}
-#msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
-.b{max-width:85%;padding:10px 14px;border-radius:16px;line-height:1.45;font-size:14px;white-space:pre-wrap}
-.u{align-self:flex-start;background:#6c5ce7}
-.a{align-self:flex-end;background:#1e1e2a}
-#bar{padding:10px;background:#1a1a24;display:flex;gap:8px}
-#bar input{flex:1;background:#0d0d14;border:1px solid #333;border-radius:20px;padding:12px;color:#eee}
-#bar button{width:46px;height:46px;border-radius:50%;border:none;background:#6c5ce7;color:#fff}
-</style></head><body>
-<header><b>AI Chat</b><button onclick="clr()">محادثة جديدة</button></header>
-<div id="msgs"></div>
-<div id="bar"><input id="inp" placeholder="رسالة..."><button onclick="send()">➤</button></div>
+:root{--bg:#0b0b12;--card:#14141f;--line:#2a2a3a;--acc:#6c5ce7;--txt:#eee;--mut:#888}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);min-height:100dvh}
+.wrap{max-width:720px;margin:0 auto;min-height:100dvh;display:flex;flex-direction:column}
+nav{display:flex;gap:4px;padding:10px 12px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+nav button{flex:1;background:transparent;border:none;color:var(--mut);padding:10px;border-radius:10px;font-size:14px;cursor:pointer}
+nav button.on{background:var(--acc);color:#fff}
+.panel{display:none;flex:1;flex-direction:column;min-height:0}
+.panel.on{display:flex}
+/* chat */
+#msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.row{display:flex;flex-direction:column;max-width:88%}
+.row.me{align-self:flex-start}.row.ai{align-self:flex-end}
+.bub{padding:11px 14px;border-radius:16px;line-height:1.5;font-size:14.5px;white-space:pre-wrap;word-break:break-word}
+.row.me .bub{background:var(--acc);border-bottom-right-radius:4px}
+.row.ai .bub{background:var(--card);border:1px solid var(--line);border-bottom-left-radius:4px}
+.bub pre{background:#0a0a10;border:1px solid var(--line);border-radius:10px;padding:10px;margin:8px 0;overflow-x:auto;direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:12.5px;position:relative}
+.bub code{font-family:ui-monospace,monospace;font-size:12.5px}
+.copyc{position:absolute;top:6px;right:6px;background:#2a2a3a;border:none;color:#ccc;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer}
+.sys{align-self:center;color:var(--mut);font-size:12px}
+.bar{padding:10px 12px 16px;background:var(--card);border-top:1px solid var(--line);display:flex;gap:8px}
+.bar input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:22px;padding:12px 16px;color:var(--txt);font-size:15px;outline:none}
+.bar button{width:48px;height:48px;border-radius:50%;border:none;background:var(--acc);color:#fff;font-size:18px;cursor:pointer}
+/* link panel */
+.box{padding:20px 16px;display:flex;flex-direction:column;gap:12px}
+.box h2{font-size:18px}
+.box p{color:var(--mut);font-size:13px;line-height:1.5}
+.box input,.box button.primary{width:100%;padding:14px;border-radius:12px;border:1px solid var(--line);background:var(--bg);color:var(--txt);font-size:15px}
+.box button.primary{background:var(--acc);border:none;color:#fff;font-weight:600;cursor:pointer}
+.box .hint{font-size:12px;color:var(--mut);background:var(--card);padding:10px;border-radius:10px;border:1px solid var(--line);word-break:break-all}
+.ok{color:#2ecc71}.err{color:#e74c3c}
+.status{font-size:13px;padding:8px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <button class="on" data-p="chat">محادثة</button>
+  <button data-p="link">ربط تيليجرام</button>
+  <button data-p="info">حالة</button>
+</nav>
+
+<section id="chat" class="panel on">
+  <div id="msgs"><div class="sys">مرحبا — اكتب سؤالك</div></div>
+  <div class="bar">
+    <input id="inp" placeholder="اكتب رسالة..." autocomplete="off">
+    <button id="send">➤</button>
+  </div>
+</section>
+
+<section id="link" class="panel">
+  <div class="box">
+    <h2>ربط حساب تيليجرام</h2>
+    <p>أدخل رقمك → استلم الكود على تيليجرام → أدخله هنا. بعدها تنسخ TG_SESSION إلى Railway.</p>
+    <div id="lstep1">
+      <input id="phone" type="tel" placeholder="+9639xxxxxxx">
+      <button class="primary" id="btnPhone">إرسال الكود</button>
+    </div>
+    <div id="lstep2" style="display:none">
+      <input id="code" type="text" placeholder="كود التحقق">
+      <button class="primary" id="btnCode">تأكيد الكود</button>
+    </div>
+    <div id="lstep3" style="display:none">
+      <input id="pw" type="password" placeholder="كلمة مرور 2FA">
+      <button class="primary" id="btnPw">تأكيد</button>
+    </div>
+    <div id="lmsg" class="status"></div>
+    <div id="lsession" class="hint" style="display:none"></div>
+  </div>
+</section>
+
+<section id="info" class="panel">
+  <div class="box">
+    <h2>حالة الخدمة</h2>
+    <div id="health" class="hint">جاري الفحص...</div>
+    <p style="margin-top:12px">بعد ما يطلع TG_SESSION فوق، حطه Variable في Railway باسم <b>TG_SESSION</b> ثم Redeploy.</p>
+    <p>من حسابك في تيليجرام اكتب <b>/ai سؤالك</b> في أي محادثة (بعد الربط).</p>
+  </div>
+</section>
+</div>
 <script>
-const m=document.getElementById('msgs'),i=document.getElementById('inp');
-function add(t,c){const d=document.createElement('div');d.className='b '+c;d.textContent=t;m.appendChild(d);m.scrollTop=1e9}
-async function send(){const t=i.value.trim();if(!t)return;add(t,'u');i.value='';
-const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
-const j=await r.json();add(j.reply||j.error||'?','a')}
-async function clr(){await fetch('/api/clear',{method:'POST'});m.innerHTML=''}
-i.onkeydown=e=>{if(e.key==='Enter')send()}
-</script></body></html>"""
+const msgs=document.getElementById('msgs'),inp=document.getElementById('inp');
+document.querySelectorAll('nav button').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));
+    document.querySelectorAll('.panel').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');
+    document.getElementById(b.dataset.p).classList.add('on');
+    if(b.dataset.p==='info') loadHealth();
+  };
+});
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function fmt(t){
+  let o='';const p=t.split(/```/);
+  for(let i=0;i<p.length;i++){
+    if(i%2){let c=p[i].replace(/^[a-zA-Z0-9_+-]*\n/,'');const id='c'+Math.random().toString(36).slice(2,7);
+      o+=`<pre><button class="copyc" data-id="${id}">نسخ</button><code id="${id}">${esc(c.trim())}</code></pre>`;}
+    else o+=esc(p[i]).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  }return o;
+}
+function add(role,text){
+  if(role==='sys'){const d=document.createElement('div');d.className='sys';d.textContent=text;msgs.appendChild(d)}
+  else{const r=document.createElement('div');r.className='row '+(role==='me'?'me':'ai');
+    const b=document.createElement('div');b.className='bub';
+    if(role==='ai'){b.innerHTML=fmt(text);b.querySelectorAll('.copyc').forEach(btn=>{
+      btn.onclick=()=>{navigator.clipboard.writeText(document.getElementById(btn.dataset.id).innerText);btn.textContent='✓';setTimeout(()=>btn.textContent='نسخ',1000)};
+    })}else b.textContent=text;
+    r.appendChild(b);msgs.appendChild(r)}
+  msgs.scrollTop=1e9;
+}
+async function send(){
+  const t=inp.value.trim();if(!t)return;inp.value='';add('me',t);
+  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
+  const j=await r.json();add('ai',j.reply||j.error||'?');
+}
+document.getElementById('send').onclick=send;
+inp.onkeydown=e=>{if(e.key==='Enter')send()};
+
+const lmsg=document.getElementById('lmsg');
+function setMsg(t,ok){lmsg.textContent=t;lmsg.className='status '+(ok?'ok':'err')}
+document.getElementById('btnPhone').onclick=async()=>{
+  const phone=document.getElementById('phone').value.trim();
+  if(!phone.startsWith('+')){setMsg('الرقم يبدأ بـ +');return}
+  setMsg('جاري إرسال الكود...');
+  const r=await fetch('/api/login/phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
+  const j=await r.json();
+  if(j.error){setMsg(j.error);return}
+  setMsg('تم إرسال الكود — أدخله تحت',true);
+  document.getElementById('lstep1').style.display='none';
+  document.getElementById('lstep2').style.display='block';
+};
+document.getElementById('btnCode').onclick=async()=>{
+  const code=document.getElementById('code').value.trim();
+  setMsg('جاري التحقق...');
+  const r=await fetch('/api/login/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+  const j=await r.json();
+  if(j.need_2fa){setMsg('أدخل كلمة مرور 2FA',true);document.getElementById('lstep2').style.display='none';document.getElementById('lstep3').style.display='block';return}
+  if(j.error){setMsg(j.error);return}
+  setMsg('تم الربط ✓ انسخ TG_SESSION',true);
+  document.getElementById('lstep2').style.display='none';
+  const box=document.getElementById('lsession');box.style.display='block';box.textContent=j.session;
+};
+document.getElementById('btnPw').onclick=async()=>{
+  const password=document.getElementById('pw').value;
+  setMsg('جاري...');
+  const r=await fetch('/api/login/2fa',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
+  const j=await r.json();
+  if(j.error){setMsg(j.error);return}
+  setMsg('تم الربط ✓',true);
+  document.getElementById('lstep3').style.display='none';
+  const box=document.getElementById('lsession');box.style.display='block';box.textContent=j.session;
+};
+async function loadHealth(){
+  const r=await fetch('/health');const j=await r.json();
+  document.getElementById('health').textContent=
+    `BOT_TOKEN: ${j.bot?'✓':'✗'}\nTG_API_ID: ${j.api_id?'✓':'✗'}\nGROQ: ${j.groq?'✓':'✗'}\nTG_SESSION: ${j.session?'✓':'✗'}`;
+}
+</script>
+</body>
+</html>"""
 
 @app.route("/")
 def index():
-    return render_template_string(WEB_HTML)
+    return render_template_string(PAGE)
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
@@ -249,7 +272,7 @@ def api_chat():
         return jsonify({"error": "فارغ"}), 400
     sid = session.get("sid") or str(uuid.uuid4())
     session["sid"] = sid
-    hist = SESSIONS.setdefault(sid, [])
+    hist = WEB_SESSIONS.setdefault(sid, [])
     hist.append({"role": "user", "content": message})
     if len(hist) > 16:
         hist[:] = hist[-16:]
@@ -261,22 +284,100 @@ def api_chat():
 def api_clear():
     sid = session.get("sid")
     if sid:
-        SESSIONS[sid] = []
+        WEB_SESSIONS[sid] = []
     return jsonify({"ok": True})
+
+@app.route("/api/login/phone", methods=["POST"])
+def login_phone():
+    if not API_ID or not API_HASH:
+        return jsonify({"error": "TG_API_ID / TG_API_HASH ناقصين"}), 400
+    data = request.get_json(force=True) or {}
+    phone = (data.get("phone") or "").replace(" ", "")
+    if not phone.startswith("+"):
+        return jsonify({"error": "الرقم يبدأ بـ +"}), 400
+    sid = session.get("sid") or str(uuid.uuid4())
+    session["sid"] = sid
+    try:
+        client, pch = run_async(tg_send_code(phone))
+        LOGIN_STATE[sid] = {"client": client, "phone": phone, "pch": pch}
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/login/code", methods=["POST"])
+def login_code():
+    sid = session.get("sid")
+    st = LOGIN_STATE.get(sid)
+    if not st:
+        return jsonify({"error": "ابدأ بإدخال الرقم أولاً"}), 400
+    data = request.get_json(force=True) or {}
+    code = (data.get("code") or "").strip()
+    try:
+        session_str, err = run_async(tg_sign_in(st["client"], st["phone"], code, st["pch"]))
+        if err == "2fa":
+            st["need_2fa"] = True
+            return jsonify({"need_2fa": True})
+        if err:
+            return jsonify({"error": err}), 400
+        LOGIN_STATE.pop(sid, None)
+        return jsonify({"session": session_str})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/login/2fa", methods=["POST"])
+def login_2fa():
+    sid = session.get("sid")
+    st = LOGIN_STATE.get(sid)
+    if not st:
+        return jsonify({"error": "ابدأ من جديد"}), 400
+    data = request.get_json(force=True) or {}
+    password = data.get("password") or ""
+    try:
+        session_str, err = run_async(tg_sign_in(st["client"], st["phone"], None, None, password=password))
+        if err:
+            return jsonify({"error": err}), 400
+        LOGIN_STATE.pop(sid, None)
+        return jsonify({"session": session_str})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Telegram webhook still available
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(force=True, silent=True) or {}
+    msg = data.get("message") or {}
+    text = (msg.get("text") or "").strip()
+    chat_id = (msg.get("chat") or {}).get("id")
+    if not chat_id:
+        return jsonify({"ok": True})
+    if text.startswith("/start"):
+        tsend(chat_id, "استخدم الموقع لربط الحساب.\nمن حسابك بعد الربط: /ai سؤالك")
+    elif text.startswith("/ai"):
+        q = text[3:].strip()
+        if q:
+            hist = TG_HISTORY.setdefault(chat_id, [])
+            ans = ask_ai(q, hist)
+            hist.append({"role": "user", "content": q})
+            hist.append({"role": "assistant", "content": ans})
+            tsend(chat_id, ans)
+    return jsonify({"ok": True})
+
+@app.route("/setup_webhook")
+def setup_webhook():
+    url = request.args.get("url") or (f"https://{PUBLIC_URL}" if PUBLIC_URL else "")
+    if not url:
+        return "؟url=https://xxx.up.railway.app", 400
+    return jsonify(tg("setWebhook", url=url.rstrip("/") + "/telegram"))
 
 @app.route("/health")
 def health():
     return jsonify({
         "bot": bool(BOT_TOKEN),
-        "api_id": bool(API_ID),
+        "api_id": bool(API_ID and API_HASH),
         "groq": bool(GROQ_KEY or OPENROUTER_KEY),
         "session": bool(SESSION_STR),
     })
 
 if __name__ == "__main__":
-    # set webhook if domain known
-    if BOT_TOKEN and PUBLIC_URL:
-        hook = f"https://{PUBLIC_URL}/telegram"
-        print("webhook →", tg("setWebhook", url=hook))
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
