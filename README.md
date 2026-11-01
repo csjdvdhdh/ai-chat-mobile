@@ -1,24 +1,35 @@
-# AI Chat Mobile
+# AI Chat Mobile + Telegram Bot
 
-تطبيق محادثة ذكاء اصطناعي للجوال (PWA) يعمل على Railway.
+## 1) تطبيق الويب (الجوال)
+مرفوع على Railway — واجهة شات + ملفات + نسخ كود.
 
-## المميزات
-- واجهة موبايل كاملة
-- تبديل نماذج مجانية بدون ضياع السياق
-- Groq + OpenRouter (مفاتيح مجانية)
-- يُرفع على Railway بضغطة
+## 2) بوت تيليجرام
+ملف: `telegram_bot.py`
 
-## ربط Railway
-1. ادخل https://railway.com
-2. New Project → Deploy from GitHub repo
-3. اختر `csjdvdhdh/ai-chat-mobile`
-4. أضف Variables:
-   - GROQ_API_KEY (من console.groq.com)
-   - OPENROUTER_API_KEY (اختياري)
-5. Generate Domain → افتح الرابط على هاتفك
+### المطلوب
+1. من https://my.telegram.org خذ:
+   - TG_API_ID
+   - TG_API_HASH
+2. مفتاح ذكاء: GROQ_API_KEY أو OPENROUTER_API_KEY
 
-## تشغيل محلي
+### تشغيل محلي (أول مرة يسجل دخول)
 ```bash
-pip install -r requirements.txt
-python app.py
+pip install telethon requests
+export TG_API_ID=123456
+export TG_API_HASH=xxxx
+export GROQ_API_KEY=xxxx
+python telegram_bot.py
 ```
+يدخل رقمك + رمز التحقق مرة واحدة ويحفظ الجلسة.
+
+### الأوامر داخل تيليجرام
+- `/ai سؤالك` — يسأل الذكاء
+- `/ai` (رد على رسالة) — يحلل الرسالة
+- `/clear` — يمسح سياق المحادثة
+- `/start` — مساعدة
+
+### على Railway (خدمة ثانية)
+أضف Service جديد من نفس الريبو:
+- Start Command: `python telegram_bot.py`
+- Variables: TG_API_ID, TG_API_HASH, GROQ_API_KEY
+- أول تشغيل يحتاج تفاعل (رقم + كود) — الأفضل تشغّله محلي مرة ثم ترفع ملف الجلسة، أو استخدم حساب بوت عادي لاحقاً.
