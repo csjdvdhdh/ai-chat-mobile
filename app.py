@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify, render_template_string, session
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "local-ai-chat-secret")
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4MB
 SESSIONS = {}
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
@@ -46,7 +46,6 @@ header button:active{background:#2a2a3a}
 #bar .attach{width:40px;height:40px;border-radius:50%;border:1px solid #333;background:#0d0d14;color:#eee;font-size:18px;cursor:pointer;flex-shrink:0}
 #preview{display:none;padding:6px 12px;background:#1a1a24;border-top:1px solid #2a2a3a;font-size:12px;color:#aaa;align-items:center;gap:8px}
 #preview.show{display:flex}
-#preview img{height:40px;border-radius:6px}
 #preview .rm{color:#e74c3c;cursor:pointer;border:none;background:transparent;font-size:14px}
 .typing{color:#888;font-size:13px;padding:4px 8px}
 .file-chip{display:inline-block;background:#2a2a3a;padding:4px 8px;border-radius:8px;font-size:12px;margin-top:4px}
@@ -61,12 +60,12 @@ header button:active{background:#2a2a3a}
   </div>
 </header>
 <div id="msgs">
-  <div class="sys">مرحبا — ابدأ المحادثة أو أرفق ملف/صورة</div>
+  <div class="sys">مرحبا — ابدأ المحادثة أو أرفق ملف نصي</div>
 </div>
 <div id="preview"><span id="pname"></span><button class="rm" id="prm">✕</button></div>
 <div id="bar">
   <button class="attach" id="att" title="إرفاق">📎</button>
-  <input type="file" id="file" accept="image/*,.txt,.py,.js,.json,.md,.csv,.html,.css" hidden>
+  <input type="file" id="file" accept=".txt,.py,.js,.ts,.json,.md,.csv,.html,.css,.xml,.log,.yaml,.yml" hidden>
   <input id="inp" type="text" placeholder="اكتب رسالة..." autocomplete="off">
   <button class="send" id="send">➤</button>
 </div>
@@ -78,12 +77,9 @@ const fileInput=document.getElementById('file');
 const preview=document.getElementById('preview');
 const pname=document.getElementById('pname');
 let busy=false;
-let pendingFile=null; // {name, type, data(base64)}
+let pendingFile=null;
 
-function escapeHtml(s){
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
+function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function formatMd(text){
   let out='';
   const parts=text.split(/```/);
@@ -101,61 +97,39 @@ function formatMd(text){
   }
   return out;
 }
-
 function add(role,text,extra){
   if(role==='sys'){
-    const d=document.createElement('div');
-    d.className='sys';d.textContent=text;
-    msgs.appendChild(d);
+    const d=document.createElement('div');d.className='sys';d.textContent=text;msgs.appendChild(d);
   } else {
-    const row=document.createElement('div');
-    row.className='row '+role;
-    const bubble=document.createElement('div');
-    bubble.className='bubble';
+    const row=document.createElement('div');row.className='row '+role;
+    const bubble=document.createElement('div');bubble.className='bubble';
     if(role==='bot') bubble.innerHTML=formatMd(text);
     else {
       bubble.textContent=text;
-      if(extra){
-        const chip=document.createElement('div');
-        chip.className='file-chip';
-        chip.textContent='📎 '+extra;
-        bubble.appendChild(document.createElement('br'));
-        bubble.appendChild(chip);
-      }
+      if(extra){const chip=document.createElement('div');chip.className='file-chip';chip.textContent='📎 '+extra;bubble.appendChild(document.createElement('br'));bubble.appendChild(chip)}
     }
     row.appendChild(bubble);
     if(role==='bot'){
-      const btn=document.createElement('button');
-      btn.className='copy-btn';btn.textContent='نسخ الكل';
+      const btn=document.createElement('button');btn.className='copy-btn';btn.textContent='نسخ الكل';
       btn.onclick=()=>{navigator.clipboard.writeText(text).then(()=>{btn.textContent='تم ✓';setTimeout(()=>btn.textContent='نسخ الكل',1200)})};
       row.appendChild(btn);
-      // wire code copy buttons
       bubble.querySelectorAll('.copy-code').forEach(b=>{
-        b.onclick=()=>{
-          const code=document.getElementById(b.dataset.id).innerText;
-          navigator.clipboard.writeText(code).then(()=>{b.textContent='تم ✓';setTimeout(()=>b.textContent='نسخ الكود',1200)});
-        };
+        b.onclick=()=>{const code=document.getElementById(b.dataset.id).innerText;navigator.clipboard.writeText(code).then(()=>{b.textContent='تم ✓';setTimeout(()=>b.textContent='نسخ الكود',1200)})};
       });
     }
     msgs.appendChild(row);
   }
   msgs.scrollTop=msgs.scrollHeight;
 }
-
 function clearUI(msg){msgs.innerHTML='';add('sys',msg||'محادثة جديدة')}
 document.getElementById('newchat').onclick=async()=>{await fetch('/api/clear',{method:'POST'});clearUI('محادثة جديدة')};
 document.getElementById('delchat').onclick=async()=>{await fetch('/api/clear',{method:'POST'});clearUI('تم حذف المحادثة')};
-
 document.getElementById('att').onclick=()=>fileInput.click();
 fileInput.onchange=()=>{
-  const f=fileInput.files[0];
-  if(!f)return;
+  const f=fileInput.files[0];if(!f)return;
+  if(f.size>300000){alert('الملف كبير — الحد 300KB');fileInput.value='';return}
   const reader=new FileReader();
-  reader.onload=()=>{
-    pendingFile={name:f.name,type:f.type||'application/octet-stream',data:reader.result.split(',')[1]};
-    pname.textContent='📎 '+f.name;
-    preview.classList.add('show');
-  };
+  reader.onload=()=>{pendingFile={name:f.name,type:f.type||'text/plain',data:reader.result.split(',')[1]};pname.textContent='📎 '+f.name+' ('+Math.round(f.size/1024)+'KB)';preview.classList.add('show')};
   reader.readAsDataURL(f);
 };
 document.getElementById('prm').onclick=()=>{pendingFile=null;preview.classList.remove('show');fileInput.value=''};
@@ -165,19 +139,15 @@ async function send(){
   if((!text&&!pendingFile)||busy)return;
   busy=true;sendBtn.disabled=true;
   const extra=pendingFile?pendingFile.name:null;
-  add('user',text||'(ملف مرفق)',extra);
-  inp.value='';
-  const body={message:text||'انظر إلى المرفق'};
+  add('user',text||'(ملف مرفق)',extra);inp.value='';
+  const body={message:text||'حلل هذا الملف'};
   if(pendingFile){body.file=pendingFile;pendingFile=null;preview.classList.remove('show');fileInput.value=''}
-  const typing=document.createElement('div');
-  typing.className='typing';typing.textContent='يفكر...';
+  const typing=document.createElement('div');typing.className='typing';typing.textContent='يفكر...';
   msgs.appendChild(typing);msgs.scrollTop=msgs.scrollHeight;
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const j=await r.json();
-    typing.remove();
-    if(j.error) add('bot','خطأ: '+j.error);
-    else add('bot',j.reply);
+    const j=await r.json();typing.remove();
+    if(j.error) add('bot','خطأ: '+j.error); else add('bot',j.reply);
   }catch(e){typing.remove();add('bot','فشل الاتصال')}
   busy=false;sendBtn.disabled=false;inp.focus();
 }
@@ -194,6 +164,19 @@ def get_key():
             return val, env
     return "", ""
 
+def trim_history(history, max_chars=6000):
+    """Keep recent messages under token budget."""
+    total = 0
+    kept = []
+    for m in reversed(history):
+        c = len(m.get("content") or "")
+        if total + c > max_chars:
+            break
+        kept.append(m)
+        total += c
+    kept.reverse()
+    return kept
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -202,7 +185,7 @@ def index():
 def api_chat():
     data = request.get_json(force=True) or {}
     message = (data.get("message") or "").strip()
-    file_obj = data.get("file")  # {name, type, data base64}
+    file_obj = data.get("file")
 
     if not message and not file_obj:
         return jsonify({"error": "رسالة فارغة"}), 400
@@ -215,27 +198,25 @@ def api_chat():
         SESSIONS[sid] = []
 
     history = SESSIONS[sid]
-
-    # build user content
     user_content = message or ""
+
     if file_obj:
         name = file_obj.get("name", "file")
-        ftype = file_obj.get("type", "")
         raw = file_obj.get("data", "")
-        if ftype.startswith("image/"):
-            user_content += f"\n[صورة مرفقة: {name}]"
-            # note: text-only models can't see images; we describe
-            user_content += "\n(المستخدم أرفق صورة — صف ما تراه لو أمكن أو اطلب وصفاً)"
-        else:
-            try:
-                text = b64.b64decode(raw).decode("utf-8", errors="replace")[:8000]
-                user_content += f"\n\n--- محتوى الملف {name} ---\n{text}\n--- نهاية الملف ---"
-            except Exception:
-                user_content += f"\n[ملف مرفق: {name} — تعذر قراءة النص]"
+        try:
+            text = b64.b64decode(raw).decode("utf-8", errors="replace")
+            # hard limit file text to ~4k chars to stay under TPM
+            if len(text) > 4000:
+                text = text[:4000] + "\n...[تم قص الملف لتجاوز الحد]"
+            user_content += f"\n\n--- ملف: {name} ---\n{text}\n--- نهاية ---"
+        except Exception:
+            user_content += f"\n[ملف {name} — تعذر القراءة]"
 
     history.append({"role": "user", "content": user_content.strip()})
-    if len(history) > 30:
-        history[:] = history[-30:]
+    # keep session short
+    if len(history) > 16:
+        history[:] = history[-16:]
+    SESSIONS[sid] = history
 
     api_key, key_name = get_key()
     if not api_key:
@@ -258,25 +239,24 @@ def api_chat():
 
     system = {
         "role": "system",
-        "content": (
-            "When you write code, always put it inside markdown fenced code blocks with the language tag, "
-            "for example ```python\\ncode\\n```. Keep explanations outside the code blocks. "
-            "Reply in the same language the user uses. If a file content is provided, analyze it."
-        ),
+        "content": "When writing code use markdown fences with language tag. Reply in user's language. Be concise.",
     }
-    msgs = [system] + history
+    msgs = [system] + trim_history(history, max_chars=5500)
 
-    payload = {"model": model_id, "messages": msgs, "temperature": 0.7}
+    payload = {"model": model_id, "messages": msgs, "temperature": 0.7, "max_tokens": 1500}
     try:
         r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=90)
         if r.status_code != 200 and key_name == "GROQ_API_KEY":
-            for fallback in ("qwen/qwen3.8-27b", "openai/gpt-oss-120b"):
+            for fallback in ("qwen/qwen3.8-27b", "openai/gpt-oss-20b"):
                 payload["model"] = fallback
                 r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=90)
                 if r.status_code == 200:
                     break
         if r.status_code != 200:
-            return jsonify({"error": f"{r.status_code}: {r.text[:200]}"}), 502
+            err = r.text[:220]
+            if "TPM" in err or "tokens per minute" in err or "Request too large" in err:
+                return jsonify({"error": "الطلب كبير — ابدأ محادثة جديدة أو أرفق ملف أصغر (حد 300KB)"}), 413
+            return jsonify({"error": f"{r.status_code}: {err}"}), 502
         reply = r.json()["choices"][0]["message"]["content"]
         history.append({"role": "assistant", "content": reply})
         SESSIONS[sid] = history
