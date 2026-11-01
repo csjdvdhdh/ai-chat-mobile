@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-Telegram Bot only — no personal account login.
-Set BOT_TOKEN from @BotFather + GROQ_API_KEY in Railway.
-Anyone can message the bot and use /ai
+جسر: حسابك تيليجرام ↔ ذكاء اصطناعي على Railway
+يسجل دخول بحسابك (رقم + كود) مرة واحدة ثم يربط.
+من حسابك اكتب /ai في أي شات.
 """
 
 import os
-import time
+import asyncio
 import requests
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
+API_HASH = os.environ.get("TG_API_HASH", "").strip()
+PHONE = os.environ.get("TG_PHONE", "").strip()
+CODE = os.environ.get("TG_LOGIN_CODE", "").strip()
+PASSWORD = os.environ.get("TG_2FA_PASSWORD", "").strip()
+SESSION = os.environ.get("TG_SESSION", "").strip()
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
-GROQ_MODEL = "openai/gpt-oss-20b"
 HISTORY = {}
-OFFSET = 0
 
 
-def ask_ai(question, history):
+def ask_ai(q, hist):
     key = GROQ_KEY or OPENROUTER_KEY
     if not key:
-        return "ضع GROQ_API_KEY في متغيرات Railway"
-
+        return "GROQ_API_KEY ناقص"
     if GROQ_KEY:
-        base, model = "https://api.groq.com/openai/v1", GROQ_MODEL
+        base, model = "https://api.groq.com/openai/v1", "openai/gpt-oss-20b"
         headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     else:
         base, model = "https://openrouter.ai/api/v1", "openrouter/auto"
@@ -32,112 +37,95 @@ def ask_ai(question, history):
             "Authorization": f"Bearer {OPENROUTER_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/csjdvdhdh/ai-chat-mobile",
-            "X-Title": "TG AI Bot",
+            "X-Title": "AI Bridge",
         }
-
-    system = {
-        "role": "system",
-        "content": "Helpful assistant on Telegram. Reply in the user's language. Concise. Code in ``` fences.",
-    }
-    msgs = [system] + history[-10:] + [{"role": "user", "content": question}]
+    msgs = [{"role": "system", "content": "Assistant on Telegram. Same language as user. Concise. Code in ```."}]
+    msgs += hist[-10:]
+    msgs.append({"role": "user", "content": q})
     payload = {"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1200}
-
     try:
         r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200 and GROQ_KEY:
             payload["model"] = "qwen/qwen3.8-27b"
             r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            return f"خطأ AI {r.status_code}: {r.text[:120]}"
+            return f"AI {r.status_code}: {r.text[:100]}"
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"خطأ: {e}"
+        return str(e)
 
 
-def tg(method, **params):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    return requests.post(url, json=params, timeout=35).json()
-
-
-def send(chat_id, text, reply_to=None):
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n..."
-    p = {"chat_id": chat_id, "text": text}
-    if reply_to:
-        p["reply_to_message_id"] = reply_to
-    tg("sendMessage", **p)
-
-
-def handle(update):
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
+async def main():
+    if not API_ID or not API_HASH:
+        print("محتاج: TG_API_ID + TG_API_HASH من my.telegram.org")
         return
-    chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
-    mid = msg.get("message_id")
-
-    if text.startswith("/start") or text.startswith("/help"):
-        send(chat_id,
-             "بوت الذكاء الاصطناعي\n\n"
-             "/ai سؤالك — اسأل\n"
-             "/ai (رد على رسالة) — يحللها\n"
-             "/clear — مسح السياق")
+    if not (GROQ_KEY or OPENROUTER_KEY):
+        print("محتاج: GROQ_API_KEY")
         return
 
-    if text.startswith("/clear"):
-        HISTORY.pop(chat_id, None)
-        send(chat_id, "تم مسح السياق")
-        return
+    if SESSION:
+        client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+    else:
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
 
-    if text.startswith("/ai"):
-        q = text[3:].strip()
-        if not q and msg.get("reply_to_message"):
-            q = (msg["reply_to_message"].get("text") or "").strip()
-        if not q:
-            send(chat_id, "اكتب:\n/ai سؤالك\nأو رد على رسالة بـ /ai", reply_to=mid)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        if not PHONE:
+            print("حط TG_PHONE=+96xxxxxxx ثم أعد التشغيل")
             return
-        hist = HISTORY.setdefault(chat_id, [])
-        send(chat_id, "يفكر...", reply_to=mid)
-        ans = ask_ai(q, hist)
+        print("إرسال كود إلى", PHONE)
+        await client.send_code_request(PHONE)
+        if not CODE:
+            print(">>> الكود وصل على تيليجرام")
+            print(">>> حط المتغير TG_LOGIN_CODE=الكود ثم Redeploy")
+            await asyncio.sleep(3600)
+            return
+        try:
+            await client.sign_in(PHONE, CODE)
+        except SessionPasswordNeededError:
+            if not PASSWORD:
+                print(">>> حسابك فيه تحقق بخطوتين — حط TG_2FA_PASSWORD ثم Redeploy")
+                await asyncio.sleep(3600)
+                return
+            await client.sign_in(password=PASSWORD)
+
+        s = client.session.save()
+        print("=" * 40)
+        print("انسخ هذا المتغير TG_SESSION=")
+        print(s)
+        print("=" * 40)
+        print("بعدها امسح TG_LOGIN_CODE و Redeploy")
+
+    me = await client.get_me()
+    print("تم الربط بحسابك:", me.first_name, me.id)
+    print("من حسابك اكتب /ai في أي محادثة")
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^/ai(?:\s+|$)([\s\S]*)"))
+    async def ai_cmd(event):
+        q = (event.pattern_match.group(1) or "").strip()
+        if not q and event.is_reply:
+            rm = await event.get_reply_message()
+            q = (rm.text or "").strip()
+        if not q:
+            await event.reply("/ai سؤالك\nأو رد على رسالة بـ /ai")
+            return
+        hist = HISTORY.setdefault(event.chat_id, [])
+        st = await event.reply("...")
+        ans = await asyncio.get_event_loop().run_in_executor(None, ask_ai, q, hist)
         hist.append({"role": "user", "content": q})
         hist.append({"role": "assistant", "content": ans})
         if len(hist) > 20:
-            HISTORY[chat_id] = hist[-20:]
-        send(chat_id, ans, reply_to=mid)
-        return
+            HISTORY[event.chat_id] = hist[-20:]
+        await st.edit(ans[:4000])
 
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^/clear$"))
+    async def clear_cmd(event):
+        HISTORY.pop(event.chat_id, None)
+        await event.reply("تم المسح")
 
-def main():
-    global OFFSET
-    if not BOT_TOKEN:
-        print("ضع BOT_TOKEN من @BotFather")
-        return
-    if not (GROQ_KEY or OPENROUTER_KEY):
-        print("ضع GROQ_API_KEY")
-        return
-
-    me = tg("getMe")
-    if not me.get("ok"):
-        print("توكن غير صالح:", me)
-        return
-    print("bot @" + str(me["result"].get("username")) + " running")
-
-    while True:
-        try:
-            data = tg("getUpdates", offset=OFFSET, timeout=30)
-            if not data.get("ok"):
-                time.sleep(2)
-                continue
-            for u in data.get("result", []):
-                OFFSET = u["update_id"] + 1
-                try:
-                    handle(u)
-                except Exception as e:
-                    print("err", e)
-        except Exception as e:
-            print("poll", e)
-            time.sleep(5)
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
