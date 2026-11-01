@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-Telegram AI Bot — login with phone+code, reply to /ai questions
-Uses same GROQ / OpenRouter keys as the web app.
+Telegram Bot (Bot API) — put BOT_TOKEN + GROQ key in Railway vars.
+Users talk to the bot with /ai
 """
 
 import os
-import asyncio
-import json
-from pathlib import Path
+import time
+import requests
 
-try:
-    from telethon import TelegramClient, events
-    from telethon.errors import SessionPasswordNeededError
-    import requests
-except ImportError:
-    print("pip install telethon requests")
-    raise SystemExit(1)
-
-# --- config from env (set in Railway) ---
-API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+# optional overrides
+API_ID = os.environ.get("TG_API_ID", "")
 API_HASH = os.environ.get("TG_API_HASH", "")
-GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-SESSION = os.environ.get("TG_SESSION", "ai_bot_session")
 
-# free models
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_BASE = "https://api.groq.com/openai/v1"
 OR_BASE = "https://openrouter.ai/api/v1"
 
+# chat_id -> list of messages
+HISTORY = {}
+OFFSET = 0
+
+
 def ask_ai(question: str, history: list) -> str:
     key = GROQ_KEY or OPENROUTER_KEY
     if not key:
-        return "مفتاح الذكاء غير موجود (GROQ_API_KEY أو OPENROUTER_API_KEY)"
+        return "مفتاح الذكاء غير موجود في المتغيرات (GROQ_API_KEY)"
 
     if GROQ_KEY:
         base, model = GROQ_BASE, GROQ_MODEL
@@ -48,9 +43,9 @@ def ask_ai(question: str, history: list) -> str:
 
     system = {
         "role": "system",
-        "content": "You are a helpful assistant inside Telegram. Reply in the same language as the user. Be concise. Put code in markdown fences.",
+        "content": "You are a helpful assistant on Telegram. Reply in the user's language. Be concise. Put code in ``` fences.",
     }
-    msgs = [system] + history[-12:] + [{"role": "user", "content": question}]
+    msgs = [system] + history[-10:] + [{"role": "user", "content": question}]
     payload = {"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1200}
 
     try:
@@ -59,80 +54,105 @@ def ask_ai(question: str, history: list) -> str:
             payload["model"] = "qwen/qwen3.8-27b"
             r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            return f"خطأ AI: {r.status_code} {r.text[:150]}"
+            return f"خطأ AI: {r.status_code} — {r.text[:120]}"
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"خطأ: {e}"
 
 
-# per-chat history (in memory)
-CHAT_HISTORY = {}
+def api(method, **params):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    r = requests.post(url, json=params, timeout=30)
+    return r.json()
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
+
+def send(chat_id, text, reply_to=None):
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n...[مقصوص]"
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    api("sendMessage", **payload)
 
 
-@client.on(events.NewMessage(pattern=r"(?i)^/ai(?:\s+|$)(.*)"))
-async def ai_handler(event):
-    question = (event.pattern_match.group(1) or "").strip()
-    if not question:
-        # reply to a message?
-        if event.is_reply:
-            reply_msg = await event.get_reply_message()
-            question = (reply_msg.text or "").strip()
+def handle(update):
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        return
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip()
+    mid = msg.get("message_id")
+
+    if text.startswith("/start") or text.startswith("/help"):
+        send(chat_id,
+             "بوت الذكاء الاصطناعي\n\n"
+             "الأوامر:\n"
+             "/ai سؤالك — اسأل أي شيء\n"
+             "/ai (رد على رسالة) — يحلل الرسالة\n"
+             "/clear — مسح السياق\n"
+             "/id — رقم الشات")
+        return
+
+    if text.startswith("/id"):
+        send(chat_id, f"chat_id: {chat_id}")
+        return
+
+    if text.startswith("/clear"):
+        HISTORY.pop(chat_id, None)
+        send(chat_id, "تم مسح السياق")
+        return
+
+    if text.startswith("/ai"):
+        question = text[3:].strip()
+        # reply to message?
+        if not question and msg.get("reply_to_message"):
+            question = (msg["reply_to_message"].get("text") or "").strip()
         if not question:
-            await event.reply("استخدم: `/ai سؤالك هنا`\nأو رد على رسالة بـ `/ai`")
+            send(chat_id, "استخدم:\n/ai سؤالك هنا\nأو رد على رسالة واكتب /ai", reply_to=mid)
             return
 
-    chat_id = event.chat_id
-    hist = CHAT_HISTORY.setdefault(chat_id, [])
-
-    await event.reply("يفكر...")
-    answer = await asyncio.get_event_loop().run_in_executor(None, ask_ai, question, hist)
-
-    hist.append({"role": "user", "content": question})
-    hist.append({"role": "assistant", "content": answer})
-    if len(hist) > 20:
-        CHAT_HISTORY[chat_id] = hist[-20:]
-
-    # Telegram message limit ~4096
-    if len(answer) > 4000:
-        answer = answer[:4000] + "\n\n...[مقصوص]"
-    await event.reply(answer)
+        hist = HISTORY.setdefault(chat_id, [])
+        send(chat_id, "يفكر...", reply_to=mid)
+        answer = ask_ai(question, hist)
+        hist.append({"role": "user", "content": question})
+        hist.append({"role": "assistant", "content": answer})
+        if len(hist) > 20:
+            HISTORY[chat_id] = hist[-20:]
+        send(chat_id, answer, reply_to=mid)
+        return
 
 
-@client.on(events.NewMessage(pattern=r"(?i)^/(start|help)$"))
-async def start_handler(event):
-    await event.reply(
-        "بوت الذكاء الاصطناعي\n\n"
-        "الأوامر:\n"
-        "`/ai سؤالك` — اسأل أي شيء\n"
-        "`/ai` (رد على رسالة) — يحلل الرسالة\n"
-        "`/clear` — مسح سياق هذه المحادثة\n"
-    )
-
-
-@client.on(events.NewMessage(pattern=r"(?i)^/clear$"))
-async def clear_handler(event):
-    CHAT_HISTORY.pop(event.chat_id, None)
-    await event.reply("تم مسح السياق لهذه المحادثة")
-
-
-async def main():
-    if not API_ID or not API_HASH:
-        print("ضع TG_API_ID و TG_API_HASH في المتغيرات")
-        print("من https://my.telegram.org")
+def main():
+    global OFFSET
+    if not BOT_TOKEN:
+        print("ضع BOT_TOKEN من @BotFather في متغيرات Railway")
         return
     if not (GROQ_KEY or OPENROUTER_KEY):
         print("ضع GROQ_API_KEY أو OPENROUTER_API_KEY")
         return
 
-    print("connecting...")
-    await client.start()
-    me = await client.get_me()
-    print(f"logged in as {me.first_name} (@{me.username})")
-    print("bot ready — send /ai in any chat")
-    await client.run_until_disconnected()
+    me = api("getMe")
+    if not me.get("ok"):
+        print("توكن البوت غير صالح:", me)
+        return
+    print("bot:", me["result"].get("username"), "— polling...")
+
+    while True:
+        try:
+            data = api("getUpdates", offset=OFFSET, timeout=30)
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
+            for upd in data.get("result", []):
+                OFFSET = upd["update_id"] + 1
+                try:
+                    handle(upd)
+                except Exception as e:
+                    print("handle error:", e)
+        except Exception as e:
+            print("poll error:", e)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
