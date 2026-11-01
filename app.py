@@ -6,14 +6,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "local-ai-chat-secret")
 SESSIONS = {}
 
-# current free Groq models (2026)
 DEFAULT_MODEL = "openai/gpt-oss-20b"
-MODELS = {
-  "openai/gpt-oss-20b": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY"},
-  "openai/gpt-oss-120b": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY"},
-  "qwen/qwen3.8-27b": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY"},
-  "openrouter/auto": {"base": "https://openrouter.ai/api/v1", "key": "OPENROUTER_API_KEY"},
-}
 
 HTML = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -31,11 +24,16 @@ header h1{font-size:16px;font-weight:600}
 header .actions{display:flex;gap:8px}
 header button{background:#0d0d14;color:#eee;border:1px solid #333;border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer}
 header button:active{background:#2a2a3a}
-#msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;-webkit-overflow-scrolling:touch}
-.bubble{max-width:85%;padding:10px 14px;border-radius:16px;line-height:1.45;font-size:15px;word-break:break-word}
-.user{align-self:flex-start;background:#6c5ce7;border-bottom-right-radius:4px}
-.bot{align-self:flex-end;background:#1e1e2a;border-bottom-left-radius:4px}
-.sys{align-self:center;background:transparent;color:#666;font-size:12px}
+#msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;-webkit-overflow-scrolling:touch}
+.row{display:flex;flex-direction:column;max-width:85%}
+.row.user{align-self:flex-start}
+.row.bot{align-self:flex-end}
+.bubble{padding:10px 14px;border-radius:16px;line-height:1.45;font-size:15px;word-break:break-word}
+.row.user .bubble{background:#6c5ce7;border-bottom-right-radius:4px}
+.row.bot .bubble{background:#1e1e2a;border-bottom-left-radius:4px}
+.sys{align-self:center;background:transparent;color:#666;font-size:12px;padding:4px}
+.copy-btn{margin-top:4px;align-self:flex-start;background:transparent;border:none;color:#6c5ce7;font-size:12px;cursor:pointer;padding:2px 6px}
+.copy-btn:active{opacity:.6}
 #bar{padding:10px 12px 16px;background:#1a1a24;border-top:1px solid #2a2a3a;display:flex;gap:8px;flex-shrink:0}
 #bar input{flex:1;background:#0d0d14;border:1px solid #333;border-radius:24px;padding:12px 16px;color:#eee;font-size:15px;outline:none}
 #bar button{width:48px;height:48px;border-radius:50%;border:none;background:#6c5ce7;color:#fff;font-size:18px;cursor:pointer;flex-shrink:0}
@@ -52,7 +50,7 @@ header button:active{background:#2a2a3a}
   </div>
 </header>
 <div id="msgs">
-  <div class="bubble sys">مرحبا — ابدأ المحادثة</div>
+  <div class="sys">مرحبا — ابدأ المحادثة</div>
 </div>
 <div id="bar">
   <input id="inp" type="text" placeholder="اكتب رسالة..." autocomplete="off">
@@ -63,13 +61,37 @@ const msgs=document.getElementById('msgs');
 const inp=document.getElementById('inp');
 const sendBtn=document.getElementById('send');
 let busy=false;
+
 function add(role,text){
-  const d=document.createElement('div');
-  d.className='bubble '+role;
-  d.textContent=text;
-  msgs.appendChild(d);
+  if(role==='sys'){
+    const d=document.createElement('div');
+    d.className='sys';
+    d.textContent=text;
+    msgs.appendChild(d);
+  } else {
+    const row=document.createElement('div');
+    row.className='row '+role;
+    const bubble=document.createElement('div');
+    bubble.className='bubble';
+    bubble.textContent=text;
+    row.appendChild(bubble);
+    if(role==='bot'){
+      const btn=document.createElement('button');
+      btn.className='copy-btn';
+      btn.textContent='نسخ';
+      btn.onclick=()=>{
+        navigator.clipboard.writeText(text).then(()=>{
+          btn.textContent='تم ✓';
+          setTimeout(()=>btn.textContent='نسخ',1200);
+        });
+      };
+      row.appendChild(btn);
+    }
+    msgs.appendChild(row);
+  }
   msgs.scrollTop=msgs.scrollHeight;
 }
+
 function clearUI(msg){
   msgs.innerHTML='';
   add('sys', msg||'محادثة جديدة');
@@ -82,6 +104,7 @@ document.getElementById('delchat').onclick=async()=>{
   await fetch('/api/clear',{method:'POST'});
   clearUI('تم حذف المحادثة');
 };
+
 async function send(){
   const text=inp.value.trim();
   if(!text||busy)return;
@@ -169,10 +192,12 @@ def api_chat():
     try:
         r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            # try fallback model on groq
-            if key_name == "GROQ_API_KEY" and model_id != "qwen/qwen3.8-27b":
-                payload["model"] = "qwen/qwen3.8-27b"
-                r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
+            if key_name == "GROQ_API_KEY":
+                for fallback in ("qwen/qwen3.8-27b", "openai/gpt-oss-120b"):
+                    payload["model"] = fallback
+                    r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
+                    if r.status_code == 200:
+                        break
             if r.status_code != 200:
                 return jsonify({"error": f"{r.status_code}: {r.text[:200]}"}), 502
         reply = r.json()["choices"][0]["message"]["content"]
