@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-AI Chat + Telegram account bridge — better web UI, login from site.
+AI Chat web + Telegram account userbot (TG_SESSION).
+After TG_SESSION is set, your account answers /ai in any chat.
 """
 
-import os, uuid, asyncio, requests, traceback
+import os, uuid, asyncio, threading, requests
 from flask import Flask, request, jsonify, render_template_string, session
 
 app = Flask(__name__)
@@ -19,8 +20,9 @@ PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or os.environ.get("PUBL
 
 WEB_SESSIONS = {}
 TG_HISTORY = {}
-LOGIN_STATE = {}  # sid -> telethon state
+LOGIN_STATE = {}
 _loop = None
+_userbot_started = False
 
 def get_loop():
     global _loop
@@ -34,7 +36,7 @@ def run_async(coro):
 def ask_ai(question, history):
     key = GROQ_KEY or OPENROUTER_KEY
     if not key:
-        return "أضف GROQ_API_KEY في Railway Variables"
+        return "أضف GROQ_API_KEY"
     if GROQ_KEY:
         base, model = "https://api.groq.com/openai/v1", "openai/gpt-oss-20b"
         headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
@@ -46,7 +48,7 @@ def ask_ai(question, history):
             "HTTP-Referer": "https://github.com/csjdvdhdh/ai-chat-mobile",
             "X-Title": "AI Chat",
         }
-    msgs = [{"role": "system", "content": "Helpful assistant. Same language as user. Concise. Code in ``` fences."}]
+    msgs = [{"role": "system", "content": "Helpful assistant on Telegram. Same language as user. Concise. Code in ``` fences."}]
     msgs += history[-12:] + [{"role": "user", "content": question}]
     payload = {"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1500}
     try:
@@ -55,7 +57,7 @@ def ask_ai(question, history):
             payload["model"] = "qwen/qwen3.8-27b"
             r = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            return f"خطأ {r.status_code}: {r.text[:150]}"
+            return f"خطأ {r.status_code}"
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"خطأ: {e}"
@@ -68,7 +70,7 @@ def tg(method, **params):
 def tsend(chat_id, text):
     tg("sendMessage", chat_id=chat_id, text=(text or "")[:4000])
 
-# ---- Telethon helpers ----
+# ---- Telethon login for web form ----
 async def tg_send_code(phone):
     from telethon import TelegramClient
     from telethon.sessions import StringSession
@@ -90,6 +92,61 @@ async def tg_sign_in(client, phone, code, pch, password=None):
     except Exception as e:
         return None, str(e)
 
+# ---- Userbot (your account) ----
+async def run_userbot():
+    global _userbot_started
+    if not SESSION_STR or not API_ID or not API_HASH:
+        print("userbot skip: no TG_SESSION or API_ID")
+        return
+    from telethon import TelegramClient, events
+    from telethon.sessions import StringSession
+
+    client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        print("userbot: session invalid")
+        return
+    me = await client.get_me()
+    print(f"userbot linked: {me.first_name} ({me.id})")
+    _userbot_started = True
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^/ai(?:\s+|$)([\s\S]*)"))
+    async def on_ai(event):
+        q = (event.pattern_match.group(1) or "").strip()
+        if not q and event.is_reply:
+            rm = await event.get_reply_message()
+            q = (rm.text or "").strip()
+        if not q:
+            await event.reply("/ai سؤالك\nأو رد على رسالة بـ /ai")
+            return
+        hist = TG_HISTORY.setdefault(event.chat_id, [])
+        st = await event.reply("...")
+        ans = await asyncio.get_event_loop().run_in_executor(None, ask_ai, q, hist)
+        hist.append({"role": "user", "content": q})
+        hist.append({"role": "assistant", "content": ans})
+        if len(hist) > 20:
+            TG_HISTORY[event.chat_id] = hist[-20:]
+        await st.edit((ans or "")[:4000])
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^/clear$"))
+    async def on_clear(event):
+        TG_HISTORY.pop(event.chat_id, None)
+        await event.reply("تم مسح السياق")
+
+    await client.run_until_disconnected()
+
+def start_userbot_thread():
+    def runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_userbot())
+        except Exception as e:
+            print("userbot error:", e)
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    print("userbot thread started")
+
 # ---- Web UI ----
 PAGE = r"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -100,15 +157,14 @@ PAGE = r"""<!DOCTYPE html>
 <title>AI Chat</title>
 <style>
 :root{--bg:#0b0b12;--card:#14141f;--line:#2a2a3a;--acc:#6c5ce7;--txt:#eee;--mut:#888}
-*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);min-height:100dvh}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui;background:var(--bg);color:var(--txt);min-height:100dvh}
 .wrap{max-width:720px;margin:0 auto;min-height:100dvh;display:flex;flex-direction:column}
 nav{display:flex;gap:4px;padding:10px 12px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
-nav button{flex:1;background:transparent;border:none;color:var(--mut);padding:10px;border-radius:10px;font-size:14px;cursor:pointer}
+nav button{flex:1;background:transparent;border:none;color:var(--mut);padding:10px;border-radius:10px;font-size:14px}
 nav button.on{background:var(--acc);color:#fff}
 .panel{display:none;flex:1;flex-direction:column;min-height:0}
 .panel.on{display:flex}
-/* chat */
 #msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
 .row{display:flex;flex-direction:column;max-width:88%}
 .row.me{align-self:flex-start}.row.ai{align-self:flex-end}
@@ -116,21 +172,17 @@ nav button.on{background:var(--acc);color:#fff}
 .row.me .bub{background:var(--acc);border-bottom-right-radius:4px}
 .row.ai .bub{background:var(--card);border:1px solid var(--line);border-bottom-left-radius:4px}
 .bub pre{background:#0a0a10;border:1px solid var(--line);border-radius:10px;padding:10px;margin:8px 0;overflow-x:auto;direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:12.5px;position:relative}
-.bub code{font-family:ui-monospace,monospace;font-size:12.5px}
-.copyc{position:absolute;top:6px;right:6px;background:#2a2a3a;border:none;color:#ccc;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer}
+.copyc{position:absolute;top:6px;right:6px;background:#2a2a3a;border:none;color:#ccc;border-radius:6px;padding:3px 8px;font-size:11px}
 .sys{align-self:center;color:var(--mut);font-size:12px}
 .bar{padding:10px 12px 16px;background:var(--card);border-top:1px solid var(--line);display:flex;gap:8px}
 .bar input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:22px;padding:12px 16px;color:var(--txt);font-size:15px;outline:none}
-.bar button{width:48px;height:48px;border-radius:50%;border:none;background:var(--acc);color:#fff;font-size:18px;cursor:pointer}
-/* link panel */
+.bar button{width:48px;height:48px;border-radius:50%;border:none;background:var(--acc);color:#fff;font-size:18px}
 .box{padding:20px 16px;display:flex;flex-direction:column;gap:12px}
-.box h2{font-size:18px}
-.box p{color:var(--mut);font-size:13px;line-height:1.5}
+.box h2{font-size:18px}.box p{color:var(--mut);font-size:13px;line-height:1.5}
 .box input,.box button.primary{width:100%;padding:14px;border-radius:12px;border:1px solid var(--line);background:var(--bg);color:var(--txt);font-size:15px}
-.box button.primary{background:var(--acc);border:none;color:#fff;font-weight:600;cursor:pointer}
-.box .hint{font-size:12px;color:var(--mut);background:var(--card);padding:10px;border-radius:10px;border:1px solid var(--line);word-break:break-all}
-.ok{color:#2ecc71}.err{color:#e74c3c}
-.status{font-size:13px;padding:8px 0}
+.box button.primary{background:var(--acc);border:none;color:#fff;font-weight:600}
+.hint{font-size:12px;color:var(--mut);background:var(--card);padding:10px;border-radius:10px;border:1px solid var(--line);word-break:break-all}
+.ok{color:#2ecc71}.err{color:#e74c3c}.status{font-size:13px;padding:8px 0}
 </style>
 </head>
 <body>
@@ -140,122 +192,45 @@ nav button.on{background:var(--acc);color:#fff}
   <button data-p="link">ربط تيليجرام</button>
   <button data-p="info">حالة</button>
 </nav>
-
 <section id="chat" class="panel on">
   <div id="msgs"><div class="sys">مرحبا — اكتب سؤالك</div></div>
-  <div class="bar">
-    <input id="inp" placeholder="اكتب رسالة..." autocomplete="off">
-    <button id="send">➤</button>
-  </div>
+  <div class="bar"><input id="inp" placeholder="اكتب رسالة..." autocomplete="off"><button id="send">➤</button></div>
 </section>
-
 <section id="link" class="panel">
   <div class="box">
     <h2>ربط حساب تيليجرام</h2>
-    <p>أدخل رقمك → استلم الكود على تيليجرام → أدخله هنا. بعدها تنسخ TG_SESSION إلى Railway.</p>
-    <div id="lstep1">
-      <input id="phone" type="tel" placeholder="+9639xxxxxxx">
-      <button class="primary" id="btnPhone">إرسال الكود</button>
-    </div>
-    <div id="lstep2" style="display:none">
-      <input id="code" type="text" placeholder="كود التحقق">
-      <button class="primary" id="btnCode">تأكيد الكود</button>
-    </div>
-    <div id="lstep3" style="display:none">
-      <input id="pw" type="password" placeholder="كلمة مرور 2FA">
-      <button class="primary" id="btnPw">تأكيد</button>
-    </div>
+    <p>أدخل رقمك → الكود → (2FA). بعدها انسخ TG_SESSION إلى Railway Variables وأعد التشغيل.</p>
+    <div id="lstep1"><input id="phone" type="tel" placeholder="+9639xxxxxxx"><button class="primary" id="btnPhone">إرسال الكود</button></div>
+    <div id="lstep2" style="display:none"><input id="code" type="text" placeholder="كود التحقق"><button class="primary" id="btnCode">تأكيد</button></div>
+    <div id="lstep3" style="display:none"><input id="pw" type="password" placeholder="كلمة مرور 2FA"><button class="primary" id="btnPw">تأكيد</button></div>
     <div id="lmsg" class="status"></div>
     <div id="lsession" class="hint" style="display:none"></div>
   </div>
 </section>
-
 <section id="info" class="panel">
   <div class="box">
-    <h2>حالة الخدمة</h2>
-    <div id="health" class="hint">جاري الفحص...</div>
-    <p style="margin-top:12px">بعد ما يطلع TG_SESSION فوق، حطه Variable في Railway باسم <b>TG_SESSION</b> ثم Redeploy.</p>
-    <p>من حسابك في تيليجرام اكتب <b>/ai سؤالك</b> في أي محادثة (بعد الربط).</p>
+    <h2>حالة</h2>
+    <div id="health" class="hint">...</div>
+    <p>بعد TG_SESSION + Redeploy: من حسابك اكتب <b>/ai سؤالك</b> في أي شات.</p>
   </div>
 </section>
 </div>
 <script>
 const msgs=document.getElementById('msgs'),inp=document.getElementById('inp');
 document.querySelectorAll('nav button').forEach(b=>{
-  b.onclick=()=>{
-    document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));
-    document.querySelectorAll('.panel').forEach(x=>x.classList.remove('on'));
-    b.classList.add('on');
-    document.getElementById(b.dataset.p).classList.add('on');
-    if(b.dataset.p==='info') loadHealth();
-  };
+  b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById(b.dataset.p).classList.add('on');if(b.dataset.p==='info')loadHealth()};
 });
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function fmt(t){
-  let o='';const p=t.split(/```/);
-  for(let i=0;i<p.length;i++){
-    if(i%2){let c=p[i].replace(/^[a-zA-Z0-9_+-]*\n/,'');const id='c'+Math.random().toString(36).slice(2,7);
-      o+=`<pre><button class="copyc" data-id="${id}">نسخ</button><code id="${id}">${esc(c.trim())}</code></pre>`;}
-    else o+=esc(p[i]).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
-  }return o;
-}
-function add(role,text){
-  if(role==='sys'){const d=document.createElement('div');d.className='sys';d.textContent=text;msgs.appendChild(d)}
-  else{const r=document.createElement('div');r.className='row '+(role==='me'?'me':'ai');
-    const b=document.createElement('div');b.className='bub';
-    if(role==='ai'){b.innerHTML=fmt(text);b.querySelectorAll('.copyc').forEach(btn=>{
-      btn.onclick=()=>{navigator.clipboard.writeText(document.getElementById(btn.dataset.id).innerText);btn.textContent='✓';setTimeout(()=>btn.textContent='نسخ',1000)};
-    })}else b.textContent=text;
-    r.appendChild(b);msgs.appendChild(r)}
-  msgs.scrollTop=1e9;
-}
-async function send(){
-  const t=inp.value.trim();if(!t)return;inp.value='';add('me',t);
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
-  const j=await r.json();add('ai',j.reply||j.error||'?');
-}
-document.getElementById('send').onclick=send;
-inp.onkeydown=e=>{if(e.key==='Enter')send()};
-
+function fmt(t){let o='';const p=t.split(/```/);for(let i=0;i<p.length;i++){if(i%2){let c=p[i].replace(/^[a-zA-Z0-9_+-]*\n/,'');const id='c'+Math.random().toString(36).slice(2,7);o+=`<pre><button class="copyc" data-id="${id}">نسخ</button><code id="${id}">${esc(c.trim())}</code></pre>`}else o+=esc(p[i]).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')}return o}
+function add(role,text){if(role==='sys'){const d=document.createElement('div');d.className='sys';d.textContent=text;msgs.appendChild(d)}else{const r=document.createElement('div');r.className='row '+(role==='me'?'me':'ai');const b=document.createElement('div');b.className='bub';if(role==='ai'){b.innerHTML=fmt(text);b.querySelectorAll('.copyc').forEach(btn=>{btn.onclick=()=>{navigator.clipboard.writeText(document.getElementById(btn.dataset.id).innerText);btn.textContent='✓'}})}else b.textContent=text;r.appendChild(b);msgs.appendChild(r)}msgs.scrollTop=1e9}
+async function send(){const t=inp.value.trim();if(!t)return;inp.value='';add('me',t);const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});const j=await r.json();add('ai',j.reply||j.error||'?')}
+document.getElementById('send').onclick=send;inp.onkeydown=e=>{if(e.key==='Enter')send()};
 const lmsg=document.getElementById('lmsg');
 function setMsg(t,ok){lmsg.textContent=t;lmsg.className='status '+(ok?'ok':'err')}
-document.getElementById('btnPhone').onclick=async()=>{
-  const phone=document.getElementById('phone').value.trim();
-  if(!phone.startsWith('+')){setMsg('الرقم يبدأ بـ +');return}
-  setMsg('جاري إرسال الكود...');
-  const r=await fetch('/api/login/phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
-  const j=await r.json();
-  if(j.error){setMsg(j.error);return}
-  setMsg('تم إرسال الكود — أدخله تحت',true);
-  document.getElementById('lstep1').style.display='none';
-  document.getElementById('lstep2').style.display='block';
-};
-document.getElementById('btnCode').onclick=async()=>{
-  const code=document.getElementById('code').value.trim();
-  setMsg('جاري التحقق...');
-  const r=await fetch('/api/login/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
-  const j=await r.json();
-  if(j.need_2fa){setMsg('أدخل كلمة مرور 2FA',true);document.getElementById('lstep2').style.display='none';document.getElementById('lstep3').style.display='block';return}
-  if(j.error){setMsg(j.error);return}
-  setMsg('تم الربط ✓ انسخ TG_SESSION',true);
-  document.getElementById('lstep2').style.display='none';
-  const box=document.getElementById('lsession');box.style.display='block';box.textContent=j.session;
-};
-document.getElementById('btnPw').onclick=async()=>{
-  const password=document.getElementById('pw').value;
-  setMsg('جاري...');
-  const r=await fetch('/api/login/2fa',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
-  const j=await r.json();
-  if(j.error){setMsg(j.error);return}
-  setMsg('تم الربط ✓',true);
-  document.getElementById('lstep3').style.display='none';
-  const box=document.getElementById('lsession');box.style.display='block';box.textContent=j.session;
-};
-async function loadHealth(){
-  const r=await fetch('/health');const j=await r.json();
-  document.getElementById('health').textContent=
-    `BOT_TOKEN: ${j.bot?'✓':'✗'}\nTG_API_ID: ${j.api_id?'✓':'✗'}\nGROQ: ${j.groq?'✓':'✗'}\nTG_SESSION: ${j.session?'✓':'✗'}`;
-}
+document.getElementById('btnPhone').onclick=async()=>{const phone=document.getElementById('phone').value.trim();if(!phone.startsWith('+')){setMsg('يبدأ بـ +');return}setMsg('...');const r=await fetch('/api/login/phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});const j=await r.json();if(j.error){setMsg(j.error);return}setMsg('أدخل الكود',true);document.getElementById('lstep1').style.display='none';document.getElementById('lstep2').style.display='block'};
+document.getElementById('btnCode').onclick=async()=>{const code=document.getElementById('code').value.trim();setMsg('...');const r=await fetch('/api/login/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});const j=await r.json();if(j.need_2fa){setMsg('أدخل 2FA',true);document.getElementById('lstep2').style.display='none';document.getElementById('lstep3').style.display='block';return}if(j.error){setMsg(j.error);return}setMsg('تم — انسخ TG_SESSION',true);document.getElementById('lstep2').style.display='none';const box=document.getElementById('lsession');box.style.display='block';box.textContent=j.session};
+document.getElementById('btnPw').onclick=async()=>{const password=document.getElementById('pw').value;setMsg('...');const r=await fetch('/api/login/2fa',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const j=await r.json();if(j.error){setMsg(j.error);return}setMsg('تم',true);document.getElementById('lstep3').style.display='none';const box=document.getElementById('lsession');box.style.display='block';box.textContent=j.session};
+async function loadHealth(){const r=await fetch('/health');const j=await r.json();document.getElementById('health').textContent=`BOT: ${j.bot?'✓':'✗'}\nAPI_ID: ${j.api_id?'✓':'✗'}\nGROQ: ${j.groq?'✓':'✗'}\nTG_SESSION: ${j.session?'✓':'✗'}\nUserbot: ${j.userbot?'شغال ✓':'لا'}`}
 </script>
 </body>
 </html>"""
@@ -280,13 +255,6 @@ def api_chat():
     hist.append({"role": "assistant", "content": reply})
     return jsonify({"reply": reply})
 
-@app.route("/api/clear", methods=["POST"])
-def api_clear():
-    sid = session.get("sid")
-    if sid:
-        WEB_SESSIONS[sid] = []
-    return jsonify({"ok": True})
-
 @app.route("/api/login/phone", methods=["POST"])
 def login_phone():
     if not API_ID or not API_HASH:
@@ -294,7 +262,7 @@ def login_phone():
     data = request.get_json(force=True) or {}
     phone = (data.get("phone") or "").replace(" ", "")
     if not phone.startswith("+"):
-        return jsonify({"error": "الرقم يبدأ بـ +"}), 400
+        return jsonify({"error": "يبدأ بـ +"}), 400
     sid = session.get("sid") or str(uuid.uuid4())
     session["sid"] = sid
     try:
@@ -309,9 +277,8 @@ def login_code():
     sid = session.get("sid")
     st = LOGIN_STATE.get(sid)
     if not st:
-        return jsonify({"error": "ابدأ بإدخال الرقم أولاً"}), 400
-    data = request.get_json(force=True) or {}
-    code = (data.get("code") or "").strip()
+        return jsonify({"error": "ابدأ بالرقم"}), 400
+    code = (request.get_json(force=True) or {}).get("code", "").strip()
     try:
         session_str, err = run_async(tg_sign_in(st["client"], st["phone"], code, st["pch"]))
         if err == "2fa":
@@ -330,8 +297,7 @@ def login_2fa():
     st = LOGIN_STATE.get(sid)
     if not st:
         return jsonify({"error": "ابدأ من جديد"}), 400
-    data = request.get_json(force=True) or {}
-    password = data.get("password") or ""
+    password = (request.get_json(force=True) or {}).get("password") or ""
     try:
         session_str, err = run_async(tg_sign_in(st["client"], st["phone"], None, None, password=password))
         if err:
@@ -341,7 +307,6 @@ def login_2fa():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Telegram webhook still available
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(force=True, silent=True) or {}
@@ -350,9 +315,7 @@ def telegram_webhook():
     chat_id = (msg.get("chat") or {}).get("id")
     if not chat_id:
         return jsonify({"ok": True})
-    if text.startswith("/start"):
-        tsend(chat_id, "استخدم الموقع لربط الحساب.\nمن حسابك بعد الربط: /ai سؤالك")
-    elif text.startswith("/ai"):
+    if text.startswith("/ai"):
         q = text[3:].strip()
         if q:
             hist = TG_HISTORY.setdefault(chat_id, [])
@@ -360,13 +323,15 @@ def telegram_webhook():
             hist.append({"role": "user", "content": q})
             hist.append({"role": "assistant", "content": ans})
             tsend(chat_id, ans)
+    elif text.startswith("/start"):
+        tsend(chat_id, "من حسابك المرتبط اكتب /ai في أي شات")
     return jsonify({"ok": True})
 
 @app.route("/setup_webhook")
 def setup_webhook():
     url = request.args.get("url") or (f"https://{PUBLIC_URL}" if PUBLIC_URL else "")
     if not url:
-        return "؟url=https://xxx.up.railway.app", 400
+        return "need ?url=", 400
     return jsonify(tg("setWebhook", url=url.rstrip("/") + "/telegram"))
 
 @app.route("/health")
@@ -376,8 +341,15 @@ def health():
         "api_id": bool(API_ID and API_HASH),
         "groq": bool(GROQ_KEY or OPENROUTER_KEY),
         "session": bool(SESSION_STR),
+        "userbot": _userbot_started,
     })
 
+# start userbot on import (gunicorn worker)
+if SESSION_STR and API_ID and API_HASH:
+    start_userbot_thread()
+
 if __name__ == "__main__":
+    if SESSION_STR and API_ID and API_HASH and not _userbot_started:
+        start_userbot_thread()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
