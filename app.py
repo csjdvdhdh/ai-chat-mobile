@@ -113,14 +113,18 @@ async def run_userbot():
     @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^/ai(?:\s+|$)([\s\S]*)"))
     async def on_ai(event):
         q = (event.pattern_match.group(1) or "").strip()
-        if not q and event.is_reply:
+        reply_to = event.id
+        if event.is_reply:
             rm = await event.get_reply_message()
-            q = (rm.text or "").strip()
+            if rm:
+                reply_to = rm.id
+                if not q:
+                    q = (rm.text or rm.message or "").strip()
         if not q:
-            await event.reply("/ai سؤالك\nأو رد على رسالة بـ /ai")
+            await event.reply("/ai سؤالك\nأو رد على رسالة بـ /ai", reply_to=event.id)
             return
         hist = TG_HISTORY.setdefault(event.chat_id, [])
-        st = await event.reply("...")
+        st = await event.reply("...", reply_to=reply_to)
         ans = await asyncio.get_event_loop().run_in_executor(None, ask_ai, q, hist)
         hist.append({"role": "user", "content": q})
         hist.append({"role": "assistant", "content": ans})
