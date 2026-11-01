@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, uuid, requests
+import os, uuid, requests, re, html as htmlmod
 from flask import Flask, request, jsonify, render_template_string, session
 
 app = Flask(__name__)
@@ -8,7 +8,7 @@ SESSIONS = {}
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
@@ -25,13 +25,16 @@ header .actions{display:flex;gap:8px}
 header button{background:#0d0d14;color:#eee;border:1px solid #333;border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer}
 header button:active{background:#2a2a3a}
 #msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;-webkit-overflow-scrolling:touch}
-.row{display:flex;flex-direction:column;max-width:85%}
+.row{display:flex;flex-direction:column;max-width:92%}
 .row.user{align-self:flex-start}
 .row.bot{align-self:flex-end}
-.bubble{padding:10px 14px;border-radius:16px;line-height:1.45;font-size:15px;word-break:break-word}
+.bubble{padding:10px 14px;border-radius:16px;line-height:1.5;font-size:14.5px;word-break:break-word;white-space:pre-wrap}
 .row.user .bubble{background:#6c5ce7;border-bottom-right-radius:4px}
 .row.bot .bubble{background:#1e1e2a;border-bottom-left-radius:4px}
-.sys{align-self:center;background:transparent;color:#666;font-size:12px;padding:4px}
+.bubble pre{background:#0d0d14;border:1px solid #333;border-radius:10px;padding:10px 12px;margin:8px 0;overflow-x:auto;direction:ltr;text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.45;white-space:pre}
+.bubble code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:#0d0d14;padding:1px 4px;border-radius:4px}
+.bubble pre code{background:transparent;padding:0}
+.sys{align-self:center;color:#666;font-size:12px;padding:4px}
 .copy-btn{margin-top:4px;align-self:flex-start;background:transparent;border:none;color:#6c5ce7;font-size:12px;cursor:pointer;padding:2px 6px}
 .copy-btn:active{opacity:.6}
 #bar{padding:10px 12px 16px;background:#1a1a24;border-top:1px solid #2a2a3a;display:flex;gap:8px;flex-shrink:0}
@@ -62,6 +65,32 @@ const inp=document.getElementById('inp');
 const sendBtn=document.getElementById('send');
 let busy=false;
 
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatMd(text){
+  // code blocks ```
+  let out = '';
+  const parts = text.split(/```/);
+  for(let i=0;i<parts.length;i++){
+    if(i%2===1){
+      let code = parts[i];
+      // strip language tag first line
+      code = code.replace(/^[a-zA-Z0-9_+-]*\n/, '');
+      out += '<pre><code>'+escapeHtml(code.trim())+'</code></pre>';
+    } else {
+      let t = escapeHtml(parts[i]);
+      // inline code
+      t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+      // bold
+      t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      out += t;
+    }
+  }
+  return out;
+}
+
 function add(role,text){
   if(role==='sys'){
     const d=document.createElement('div');
@@ -73,7 +102,11 @@ function add(role,text){
     row.className='row '+role;
     const bubble=document.createElement('div');
     bubble.className='bubble';
-    bubble.textContent=text;
+    if(role==='bot'){
+      bubble.innerHTML = formatMd(text);
+    } else {
+      bubble.textContent = text;
+    }
     row.appendChild(bubble);
     if(role==='bot'){
       const btn=document.createElement('button');
@@ -184,9 +217,16 @@ def api_chat():
         headers["HTTP-Referer"] = "https://github.com/csjdvdhdh/ai-chat-mobile"
         headers["X-Title"] = "AI Chat Mobile"
 
+    # nudge model to format code cleanly
+    system = {
+        "role": "system",
+        "content": "When you write code, always put it inside markdown fenced code blocks with the language tag, for example ```python\\ncode\\n```. Keep explanations outside the code blocks. Reply in the same language the user uses."
+    }
+    msgs = [system] + history
+
     payload = {
         "model": model_id,
-        "messages": history,
+        "messages": msgs,
         "temperature": 0.7,
     }
     try:
